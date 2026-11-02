@@ -1,0 +1,119 @@
+name: owned-a-artifact-boundary-fixture
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create inert A control marker
+        shell: bash
+        run: |
+          umask 077
+          head -c 32 /dev/urandom > "$RUNNER_TEMP/owned-a-marker.bin"
+      - name: Upload A control artifact
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: owned-a-marker
+          path: ${{ runner.temp }}/owned-a-marker.bin
+          if-no-files-found: error
+          retention-days: 1
+          archive: true
+      - name: Probe with A-only job token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          A_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import io
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          a_repo = os.environ['GITHUB_REPOSITORY']
+          b_repo = 'ItsMeSamey/ghu-expiry-20261030-9eb020108e'
+          b_id = '13119653043'
+          a_id = os.environ['A_ID']
+          token = os.environ['GH_TOKEN']
+          marker_path = os.path.join(os.environ['RUNNER_TEMP'], 'owned-a-marker.bin')
+          with open(marker_path, 'rb') as marker_file:
+              a_digest = hashlib.sha256(marker_file.read()).hexdigest()
+          headers = {
+              'Accept': 'application/vnd.github+json',
+              'Authorization': 'Bearer ' + token,
+              'X-GitHub-Api-Version': '2026-03-10',
+              'User-Agent': 'owned-artifact-authorization-fixture',
+          }
+
+          def api_get(repo, artifact_id, suffix=''):
+              connection = http.client.HTTPSConnection('api.github.com', timeout=20)
+              try:
+                  path = '/repos/' + repo + '/actions/artifacts/' + artifact_id + suffix
+                  connection.request('GET', path, headers=headers)
+                  response = connection.getresponse()
+                  status = response.status
+                  location = response.getheader('Location')
+                  response.read(8192)
+                  return status, location
+              except Exception:
+                  return 0, None
+              finally:
+                  connection.close()
+
+          def download(location):
+              if not location or urllib.parse.urlsplit(location).scheme != 'https':
+                  return 0, None
+              try:
+                  request = urllib.request.Request(location, headers={'User-Agent': 'owned-artifact-authorization-fixture'})
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      status = response.status
+                      data = response.read(1048577)
+                  return status, data if len(data) <= 1048576 else None
+              except urllib.error.HTTPError as error:
+                  return error.code, None
+              except Exception:
+                  return 0, None
+
+          def marker_digest(data, expected_name):
+              if data is None:
+                  return None
+              try:
+                  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                      if archive.namelist() != [expected_name]:
+                          return None
+                      marker = archive.read(expected_name)
+                  return hashlib.sha256(marker).hexdigest() if len(marker) == 32 else None
+              except Exception:
+                  return None
+
+          own_status, own_location = api_get(a_repo, a_id, '/zip')
+          if own_status == 404:
+              time.sleep(3)
+              own_status, own_location = api_get(a_repo, a_id, '/zip')
+          own_download_status, own_data = download(own_location) if own_status == 302 else (0, None)
+          own_match = marker_digest(own_data, 'owned-a-marker.bin') == a_digest
+          print('a_own_api=' + str(own_status) + ' download=' + str(own_download_status) + ' match=' + str(own_match).lower())
+
+          direct_meta_status, _ = api_get(b_repo, b_id)
+          direct_zip_status, direct_location = api_get(b_repo, b_id, '/zip')
+          direct_denied = direct_meta_status == 404 and direct_zip_status == 404 and direct_location is None
+          print('b_direct_metadata=' + str(direct_meta_status) + ' zip=' + str(direct_zip_status) + ' denied=' + str(direct_denied).lower())
+
+          if not own_match or not direct_denied:
+              print('a_path_b=skipped_controls')
+          else:
+              candidate_status, candidate_location = api_get(a_repo, b_id, '/zip')
+              candidate_download_status, candidate_data = download(candidate_location) if candidate_status == 302 else (0, None)
+              candidate_digest = marker_digest(candidate_data, 'owned-b-marker.bin')
+              print('a_path_b_api=' + str(candidate_status) + ' download=' + str(candidate_download_status) + ' content_valid=' + str(candidate_digest is not None).lower())
+              if candidate_digest is not None:
+                  print('a_path_b_sha256=' + candidate_digest)
+          PY
